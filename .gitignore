@@ -1,0 +1,28 @@
+# 機密情報 - 絶対にコミットしない
+.env
+.env.*
+credentials.json
+*.pem
+*.key
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# ローカル生成物
+downloads/
+history.json
+*.mp4
+*.mov
+
+# macOS
+.DS_Store
+
+# エディタ
+.vscode/
+.idea/
