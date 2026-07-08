@@ -17,7 +17,6 @@ def _get_client() -> OpenAI:
 
 
 def _extract_text_from_result(result) -> str:
-    """Whisperのverbose_jsonからテキストを取り出す。セグメント単位で改行。"""
     segments = getattr(result, "segments", None) or []
     lines = []
     for seg in segments:
@@ -31,34 +30,8 @@ def _extract_text_from_result(result) -> str:
     return getattr(result, "text", None) or ""
 
 
-def _extract_audio(video_path: str) -> str | None:
-    """音声抽出（フォールバック用）。失敗時は None。"""
-    tmp_dir = tempfile.mkdtemp()
-
-    attempts = [
-        (os.path.join(tmp_dir, "audio.m4a"),
-         ["ffmpeg", "-y", "-i", video_path, "-vn", "-acodec", "copy"]),
-        (os.path.join(tmp_dir, "audio.mp3"),
-         ["ffmpeg", "-y", "-i", video_path, "-vn", "-ac", "1", "-ar", "16000", "-b:a", "64k"]),
-        (os.path.join(tmp_dir, "audio.wav"),
-         ["ffmpeg", "-y", "-i", video_path, "-vn", "-ac", "1", "-ar", "16000"]),
-        (os.path.join(tmp_dir, "audio.mp3"),
-         ["ffmpeg", "-y", "-i", video_path, "-vn"]),
-    ]
-
-    for out_path, cmd in attempts:
-        try:
-            subprocess.run(cmd + [out_path], check=True, capture_output=True)
-            if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-                return out_path
-        except subprocess.CalledProcessError:
-            continue
-
-    return None
-
-
-def _try_transcribe(file_path: str, language: str) -> str:
-    """指定ファイルをWhisperに送って文字起こし。失敗時は空文字。"""
+def _try_transcribe(file_path: str, language: str) -> tuple[str, str]:
+    """(text, error_msg)を返す。成功時はtext=文字起こし、error_msg=空。"""
     try:
         filename = os.path.basename(file_path)
         with open(file_path, "rb") as f:
@@ -68,65 +41,90 @@ def _try_transcribe(file_path: str, language: str) -> str:
                 language=language,
                 response_format="verbose_json",
             )
-        return _extract_text_from_result(result)
-    except Exception:
-        return ""
+        return _extract_text_from_result(result), ""
+    except Exception as e:
+        return "", f"Whisper API error: {e.__class__.__name__}: {str(e)[:200]}"
 
 
-def _compress_audio(video_path: str) -> str | None:
-    """大きい動画の場合、音声のみ抽出＋圧縮してWhisperサイズ制限内に。"""
-    tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False).name
+def transcribe(video_path: str, language: str = "ja") -> tuple[str, list[str]]:
+    """動画を文字起こし。(transcript, log_messages) を返す。
+    logs は Streamlitに表示するための診断メッセージ。
+    """
+    logs = []
+    tmp_dir = tempfile.mkdtemp()
+
+    # 診断: ファイルサイズを表示
     try:
-        subprocess.run(
-            [
-                "ffmpeg", "-y", "-i", video_path,
-                "-vn", "-ac", "1", "-ar", "16000", "-b:a", "32k",
-                tmp,
-            ],
-            check=True, capture_output=True,
-        )
-        if os.path.exists(tmp) and os.path.getsize(tmp) > 0:
-            return tmp
-    except subprocess.CalledProcessError:
-        pass
-    return None
-
-
-def transcribe(video_path: str, language: str = "ja") -> str:
-    """動画を文字起こし。まず動画を直接Whisperに投げ、失敗時は音声抽出フォールバック。"""
-    # Try 1: 動画ファイルを直接Whisperに送信（25MB未満）
-    try:
-        if os.path.getsize(video_path) < WHISPER_MAX_SIZE:
-            text = _try_transcribe(video_path, language)
-            if text:
-                return text
+        size_mb = os.path.getsize(video_path) / 1024 / 1024
+        logs.append(f"📊 動画サイズ: {size_mb:.1f} MB")
     except OSError:
         pass
 
-    # Try 2: 音声抽出してから送信
-    audio_path = _extract_audio(video_path)
-    if audio_path:
-        try:
-            text = _try_transcribe(audio_path, language)
+    # Try 1: 音声を強力に圧縮したmp3を作る（最も互換性高・小さいファイルサイズ）
+    compressed_mp3 = os.path.join(tmp_dir, "audio.mp3")
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-i", video_path,
+                "-vn", "-ac", "1", "-ar", "16000", "-b:a", "32k",
+                compressed_mp3,
+            ],
+            capture_output=True, text=True, timeout=120,
+        )
+        if result.returncode == 0 and os.path.exists(compressed_mp3) and os.path.getsize(compressed_mp3) > 0:
+            logs.append(f"✅ 音声圧縮成功: {os.path.getsize(compressed_mp3) / 1024:.0f} KB")
+            text, err = _try_transcribe(compressed_mp3, language)
             if text:
-                return text
-        finally:
-            try:
-                os.remove(audio_path)
-            except OSError:
-                pass
+                return text, logs
+            if err:
+                logs.append(f"❌ {err}")
+        else:
+            logs.append(f"❌ ffmpeg mp3圧縮失敗 (code {result.returncode}): {result.stderr[:200]}")
+    except subprocess.TimeoutExpired:
+        logs.append("❌ ffmpeg タイムアウト (>120秒)")
+    except Exception as e:
+        logs.append(f"❌ ffmpeg 実行失敗: {e.__class__.__name__}: {str(e)[:200]}")
 
-    # Try 3: 動画が25MB超過している場合、音声を圧縮して送信
-    compressed = _compress_audio(video_path)
-    if compressed:
-        try:
-            text = _try_transcribe(compressed, language)
+    # Try 2: 音声を acodec copy で抽出（再エンコードなし）
+    copy_m4a = os.path.join(tmp_dir, "audio.m4a")
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-i", video_path,
+                "-vn", "-acodec", "copy",
+                copy_m4a,
+            ],
+            capture_output=True, text=True, timeout=120,
+        )
+        if result.returncode == 0 and os.path.exists(copy_m4a) and os.path.getsize(copy_m4a) > 0:
+            logs.append(f"✅ 音声コピー成功: {os.path.getsize(copy_m4a) / 1024:.0f} KB")
+            text, err = _try_transcribe(copy_m4a, language)
             if text:
-                return text
-        finally:
-            try:
-                os.remove(compressed)
-            except OSError:
-                pass
+                return text, logs
+            if err:
+                logs.append(f"❌ {err}")
+        else:
+            logs.append(f"❌ ffmpeg copy失敗 (code {result.returncode}): {result.stderr[:200]}")
+    except subprocess.TimeoutExpired:
+        logs.append("❌ ffmpeg copyタイムアウト")
+    except Exception as e:
+        logs.append(f"❌ ffmpeg copy実行失敗: {e.__class__.__name__}: {str(e)[:200]}")
 
-    return ""
+    # Try 3: 動画を直接送信（25MB未満のみ）
+    try:
+        if os.path.getsize(video_path) < WHISPER_MAX_SIZE:
+            logs.append("📤 動画を直接Whisperへ送信中…")
+            text, err = _try_transcribe(video_path, language)
+            if text:
+                return text, logs
+            if err:
+                logs.append(f"❌ {err}")
+        else:
+            logs.append(f"⏭ 動画直接送信スキップ（25MB超過）")
+    except Exception as e:
+        logs.append(f"❌ 動画直接送信失敗: {e}")
+
+    logs.append("⚠️ すべての試行が失敗しました")
+    return "", logs
