@@ -15,57 +15,49 @@ def _get_client() -> OpenAI:
     return _client
 
 
-def _has_audio_stream(video_path: str) -> bool:
-    """ffprobeで音声ストリームの有無を確認。"""
-    try:
-        result = subprocess.run(
-            [
-                "ffprobe", "-v", "error",
-                "-select_streams", "a",
-                "-show_entries", "stream=codec_type",
-                "-of", "csv=p=0",
-                video_path,
-            ],
-            capture_output=True, text=True, check=True,
-        )
-        return "audio" in result.stdout
-    except subprocess.CalledProcessError:
-        return False
-
-
 def _extract_audio(video_path: str) -> str | None:
-    """音声抽出。失敗したらフォールバック順に試行し、全滅なら None。"""
-    tmp_mp3 = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False).name
+    """音声抽出。複数フォールバックあり。失敗時は None。"""
+    tmp_dir = tempfile.mkdtemp()
 
-    # 音声ストリームなしなら即諦める
-    if not _has_audio_stream(video_path):
-        return None
-
-    # Try 1: 標準（16kHz mono mp3 64kbps）
-    cmds = [
-        [
-            "ffmpeg", "-y", "-i", video_path,
-            "-vn", "-ac", "1", "-ar", "16000", "-b:a", "64k",
-            tmp_mp3,
-        ],
-        # Try 2: ビットレート指定なし
-        [
-            "ffmpeg", "-y", "-i", video_path,
-            "-vn", "-ac", "1", "-ar", "16000",
-            tmp_mp3,
-        ],
-        # Try 3: 最小限のオプション
-        [
-            "ffmpeg", "-y", "-i", video_path,
-            "-vn", tmp_mp3,
-        ],
+    attempts = [
+        # Try 1: 音声ストリームをそのまま copy（再エンコードなし・最速）
+        (
+            os.path.join(tmp_dir, "audio.m4a"),
+            [
+                "ffmpeg", "-y", "-i", video_path,
+                "-vn", "-acodec", "copy",
+            ],
+        ),
+        # Try 2: mp3 に再エンコード（16kHz mono 64kbps）
+        (
+            os.path.join(tmp_dir, "audio.mp3"),
+            [
+                "ffmpeg", "-y", "-i", video_path,
+                "-vn", "-ac", "1", "-ar", "16000", "-b:a", "64k",
+            ],
+        ),
+        # Try 3: WAV に再エンコード（ビットレート指定なし、最も互換性高）
+        (
+            os.path.join(tmp_dir, "audio.wav"),
+            [
+                "ffmpeg", "-y", "-i", video_path,
+                "-vn", "-ac", "1", "-ar", "16000",
+            ],
+        ),
+        # Try 4: 最小オプション（拡張子自動判別）
+        (
+            os.path.join(tmp_dir, "audio.mp3"),
+            [
+                "ffmpeg", "-y", "-i", video_path, "-vn",
+            ],
+        ),
     ]
 
-    for cmd in cmds:
+    for out_path, cmd in attempts:
         try:
-            subprocess.run(cmd, check=True, capture_output=True)
-            if os.path.exists(tmp_mp3) and os.path.getsize(tmp_mp3) > 0:
-                return tmp_mp3
+            subprocess.run(cmd + [out_path], check=True, capture_output=True)
+            if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                return out_path
         except subprocess.CalledProcessError:
             continue
 
@@ -79,10 +71,11 @@ def transcribe(video_path: str, language: str = "ja") -> str:
         return ""
 
     try:
+        filename = os.path.basename(audio_path)
         with open(audio_path, "rb") as f:
             result = _get_client().audio.transcriptions.create(
                 model=config.WHISPER_MODEL,
-                file=f,
+                file=(filename, f),
                 language=language,
                 response_format="verbose_json",
             )
@@ -99,7 +92,6 @@ def transcribe(video_path: str, language: str = "ja") -> str:
         full = getattr(result, "text", None) or ""
         return full
     except Exception:
-        # Whisper API側で失敗した場合も空文字返却で分析継続
         return ""
     finally:
         try:
