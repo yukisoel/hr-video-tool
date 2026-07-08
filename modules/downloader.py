@@ -55,29 +55,82 @@ def extract_key_frames(video_path: str, output_dir: str, count: int = 8) -> list
     return frames
 
 
-def download_video(url: str, output_dir: str) -> tuple[str, dict]:
-    """IG/TikTok/YouTube等のURLから動画をダウンロード。音声を必ず含める。
-    Returns: (ローカルファイルパス, メタ情報dict)"""
-    os.makedirs(output_dir, exist_ok=True)
+def _has_video_and_audio_streams(video_path: str) -> tuple[bool, bool]:
+    """(has_video, has_audio) を返す。"""
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "stream=codec_type",
+                "-of", "csv=p=0",
+                video_path,
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+        stdout = result.stdout
+        return ("video" in stdout, "audio" in stdout)
+    except Exception:
+        return (False, False)
+
+
+def _download_with_format(url: str, output_dir: str, fmt: str) -> tuple[str, dict]:
+    """指定フォーマットでダウンロード試行。"""
     ydl_opts = {
         "outtmpl": os.path.join(output_dir, "%(id)s.%(ext)s"),
-        # bestvideo+bestaudio で音声を必ず含める。単一フォーマットのbestにフォールバック
-        "format": "bestvideo*+bestaudio/best",
-        "merge_output_format": "mp4",
+        "format": fmt,
         "quiet": True,
         "no_warnings": True,
+        "retries": 3,
+        "fragment_retries": 3,
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
         filepath = ydl.prepare_filename(info)
-        # マージ後は.mp4になるので、拡張子を補正
+        # 拡張子補正
         if not os.path.exists(filepath):
             base = os.path.splitext(filepath)[0]
-            for ext in (".mp4", ".mkv", ".webm"):
+            for ext in (".mp4", ".mkv", ".webm", ".m4a"):
                 candidate = base + ext
                 if os.path.exists(candidate):
                     filepath = candidate
                     break
+    return filepath, info
+
+
+def download_video(url: str, output_dir: str) -> tuple[str, dict]:
+    """IG/TikTok/YouTube等のURLから動画をダウンロード。破損ファイル検知→再試行。
+    Returns: (ローカルファイルパス, メタ情報dict)"""
+    os.makedirs(output_dir, exist_ok=True)
+
+    # フォーマット候補：シンプル→複雑の順で試す。1つ目が最も安定
+    format_candidates = [
+        "best",                        # 単一の最良ストリーム（TikTokで最も安定）
+        "best[ext=mp4]/best",          # mp4優先
+        "bestvideo*+bestaudio/best",   # マージ型（最後の手段）
+    ]
+
+    filepath = None
+    info = None
+    for fmt in format_candidates:
+        try:
+            filepath, info = _download_with_format(url, output_dir, fmt)
+            if not filepath or not os.path.exists(filepath):
+                continue
+            has_video, has_audio = _has_video_and_audio_streams(filepath)
+            # 動画ストリームがあればOK。音声はなくてもよい（音声のない動画もあり得る）
+            if has_video:
+                break
+            # 破損ファイル → 削除して次のフォーマットへ
+            try:
+                os.remove(filepath)
+            except OSError:
+                pass
+            filepath = None
+        except Exception:
+            continue
+
+    if not filepath or not os.path.exists(filepath):
+        raise RuntimeError(f"ダウンロード失敗（全フォーマット試行済み）: {url}")
 
     meta = {
         "id": info.get("id", ""),
