@@ -53,6 +53,8 @@ def format_analysis_doc(analysis: dict, meta: dict, url: str, duration_sec) -> s
         "",
         f"タイトル: {analysis.get('video_title', '')}",
         f"サブタイトル: {analysis.get('summary_title', '')}",
+        f"類型: {analysis.get('classification', '')}",
+        f"トーン: {analysis.get('tone', '')}",
         f"URL: {url}",
         f"プラットフォーム: {downloader.platform_label(meta)}",
         f"アカウント名: {meta.get('uploader', '')} / @{meta.get('uploader_id', '')}",
@@ -87,6 +89,8 @@ def build_slide_replacements(
     return {
         "動画タイトル": analysis.get("video_title", ""),
         "タイトル": analysis.get("summary_title", ""),
+        "類型": analysis.get("classification", ""),
+        "トーン": analysis.get("tone", ""),
         "URL": url,
         "動画URL": url,
         "プラットフォーム": downloader.platform_label(meta),
@@ -245,6 +249,8 @@ def process_single_url(url: str, tmpdir: str, log, progress, prefix: str = "") -
     entry = {
         "実行日時": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "タイトル": analysis.get("video_title", ""),
+        "類型": analysis.get("classification", ""),
+        "トーン": analysis.get("tone", ""),
         "プラットフォーム": downloader.platform_label(meta),
         "アカウント": f"{meta.get('uploader', '')} / @{meta.get('uploader_id', '')}",
         "尺": fmt_duration(duration_sec),
