@@ -130,9 +130,13 @@ def process_single_url(url: str, tmpdir: str, log, progress, prefix: str = "") -
     # 2. 文字起こし（Whisper）
     progress.progress(30, text=f"{prefix}文字起こし中（Whisper）…")
     transcript = transcriber.transcribe(filepath)
-    log.write(f"✅ 文字起こし完了（{len(transcript)}文字）")
-    with log.expander("文字起こし内容"):
-        st.text(transcript)
+    if transcript:
+        log.write(f"✅ 文字起こし完了（{len(transcript)}文字）")
+        with log.expander("文字起こし内容"):
+            st.text(transcript)
+    else:
+        log.warning("⚠️ 音声なし or 抽出失敗 → 視覚のみで分析継続")
+        transcript = "（音声なし／文字起こし不可）"
 
     # 3. キーフレーム抽出（Claude画像分析用）
     progress.progress(45, text=f"{prefix}キーフレーム抽出中…")
