@@ -102,26 +102,26 @@ def download_video(url: str, output_dir: str) -> tuple[str, dict]:
     Returns: (ローカルファイルパス, メタ情報dict)"""
     os.makedirs(output_dir, exist_ok=True)
 
-    # フォーマット候補：音声＋動画両方あるものを最優先。段階的に条件を緩める
+    # フォーマット候補：まず一番信頼できる `best` で確実にファイルを取得し、
+    # それが video-only だった場合のみ音声ありを狙って追加試行する。
+    # （TikTokは環境によって `[acodec!=none]` フィルタで全滅することがある）
     format_candidates = [
-        # 音声・動画両方ある単一ストリーム（TikTokで最も安定・確実に音声あり）
-        "best[acodec!=none][vcodec!=none]",
-        # mp4 + 音声あり
-        "best[ext=mp4][acodec!=none]/best[acodec!=none]",
-        # マージ型（動画と音声を別々に取得してffmpegで結合）
-        "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio",
-        # 最後の砦：音声不問
-        "best",
+        "best",                                                       # 単一ベスト（最も安定）
+        "best[acodec!=none][vcodec!=none]",                           # 音声+動画両方あり
+        "best[ext=mp4][acodec!=none]/best[acodec!=none]",             # mp4かつ音声あり
+        "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio",  # マージ型
     ]
 
     filepath = None
     info = None
     video_only_fallback = None
     video_only_info = None
+    per_format_errors: list[str] = []
     for fmt in format_candidates:
         try:
             candidate_path, candidate_info = _download_with_format(url, output_dir, fmt)
             if not candidate_path or not os.path.exists(candidate_path):
+                per_format_errors.append(f"{fmt}: ファイル未生成")
                 continue
             has_video, has_audio = _has_video_and_audio_streams(candidate_path)
             if has_video and has_audio:
@@ -129,7 +129,7 @@ def download_video(url: str, output_dir: str) -> tuple[str, dict]:
                 info = candidate_info
                 break
             if has_video and not has_audio:
-                # 音声なし。次のフォーマットで音声ありを狙うが、他が全滅した場合の保険として1つだけ保持
+                # 音声なし。他候補で音声ありを狙うが、全滅時の保険として1つだけ保持
                 if video_only_fallback is None:
                     video_only_fallback = candidate_path
                     video_only_info = candidate_info
@@ -138,13 +138,16 @@ def download_video(url: str, output_dir: str) -> tuple[str, dict]:
                         os.remove(candidate_path)
                     except OSError:
                         pass
+                per_format_errors.append(f"{fmt}: 音声ストリームなし")
                 continue
             # 動画すらない → 破損。削除して次へ
             try:
                 os.remove(candidate_path)
             except OSError:
                 pass
-        except Exception:
+            per_format_errors.append(f"{fmt}: 動画ストリームなし（破損）")
+        except Exception as e:
+            per_format_errors.append(f"{fmt}: {e.__class__.__name__}: {str(e)[:150]}")
             continue
 
     # 音声あり版が取れなかったら video-only フォールバックを使う（視覚のみで分析継続）
@@ -153,7 +156,8 @@ def download_video(url: str, output_dir: str) -> tuple[str, dict]:
         info = video_only_info
 
     if not filepath or not os.path.exists(filepath):
-        raise RuntimeError(f"ダウンロード失敗（全フォーマット試行済み）: {url}")
+        detail = " ｜ ".join(per_format_errors) if per_format_errors else "詳細不明"
+        raise RuntimeError(f"ダウンロード失敗: {url}\n試行結果: {detail}")
 
     meta = {
         "id": info.get("id", ""),
