@@ -73,13 +73,6 @@ def _has_video_and_audio_streams(video_path: str) -> tuple[bool, bool]:
         return (False, False)
 
 
-# モバイル/APIで音声つきを配信させるためのUAとextractor引数
-_MOBILE_UA = (
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) "
-    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
-)
-
-
 def _download_with_format(url: str, output_dir: str, fmt: str) -> tuple[str, dict]:
     """指定フォーマットでダウンロード試行。"""
     ydl_opts = {
@@ -89,8 +82,6 @@ def _download_with_format(url: str, output_dir: str, fmt: str) -> tuple[str, dic
         "no_warnings": True,
         "retries": 3,
         "fragment_retries": 3,
-        # モバイルUAだけ渡す（extractor_args は指定するとAPI hostnameの陳腐化で全滅するので使わない）
-        "http_headers": {"User-Agent": _MOBILE_UA},
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
