@@ -89,16 +89,8 @@ def _download_with_format(url: str, output_dir: str, fmt: str) -> tuple[str, dic
         "no_warnings": True,
         "retries": 3,
         "fragment_retries": 3,
-        # TikTok: モバイル/API経由で音声つきを取りに行く（Web経由だと video-only になることがある）
+        # モバイルUAだけ渡す（extractor_args は指定するとAPI hostnameの陳腐化で全滅するので使わない）
         "http_headers": {"User-Agent": _MOBILE_UA},
-        "extractor_args": {
-            "tiktok": {
-                "api_hostname": ["api22-normal-c-alisg.tiktokv.com"],
-                "app_name": ["trill"],
-                "app_version": ["34.1.2"],
-                "manifest_app_version": ["2023401020"],
-            }
-        },
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
