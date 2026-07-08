@@ -428,24 +428,105 @@ def process_single_url(
     return _finalize_success()
 
 
+def execute_url_batch(urls: list[str]):
+    """URLリストを順次処理。tab_run と tab_history どちらからでも呼べる共通関数。
+    per-URL の表示は st.container(border=True) を使うため、expander の中から呼んでも安全。"""
+    total = len(urls)
+    results = {"success": [], "resumed": [], "fail": [], "skipped": []}
+
+    overall_progress = st.progress(0, text=f"0 / {total} 完了")
+    overall_status = st.empty()
+
+    for idx, one_url in enumerate(urls, 1):
+        prefix = f"[{idx}/{total}] "
+        overall_status.info(f"🎬 {prefix}処理中：{one_url}")
+
+        prior = history.find_by_url(one_url)
+
+        # 成功済みならスキップ
+        if prior and prior.get("ステータス") == "成功":
+            with st.container(border=True):
+                st.markdown(f"⏭ **{prefix}{one_url}**（既に成功済みのためスキップ）")
+                st.info(f"✅ 前回成功済み：{prior.get('タイトル', '')}")
+                if prior.get("Driveフォルダ"):
+                    st.markdown(f"📂 フォルダ：{prior.get('Driveフォルダ')}")
+            results["skipped"].append(prior)
+            overall_progress.progress(idx / total, text=f"{idx} / {total} 完了")
+            continue
+
+        with st.container(border=True):
+            st.markdown(f"🎬 **{prefix}{one_url}**")
+            inner_log = st.container()
+            inner_progress = st.progress(0, text=f"{prefix}開始します…")
+            entry = None
+            try:
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    entry = process_single_url(
+                        one_url, tmpdir, inner_log, inner_progress,
+                        prefix=prefix, prior_entry=prior,
+                    )
+            except Exception as e:
+                inner_log.error(f"❌ {prefix}想定外の失敗：{e}")
+                entry = {
+                    "実行日時": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "URL": one_url,
+                    "ステータス": "失敗",
+                    "失敗ステップ": "想定外エラー",
+                    "エラー": str(e),
+                }
+                if prior:
+                    for k, v in prior.items():
+                        if k.startswith("_") and k not in entry:
+                            entry[k] = v
+
+            if entry:
+                history.save_entry(entry)
+                if entry.get("ステータス") == "成功":
+                    was_resumed = bool(prior)
+                    (results["resumed"] if was_resumed else results["success"]).append(entry)
+                    marker = "♻️ 再開して" if was_resumed else "✅ "
+                    inner_log.success(f"{marker}{prefix}完了：{entry.get('タイトル', '')}")
+                    inner_log.markdown(f"📂 フォルダ：{entry.get('Driveフォルダ', '')}")
+                else:
+                    results["fail"].append(entry)
+                    inner_log.error(
+                        f"❌ {prefix}失敗（{entry.get('失敗ステップ', '不明')}）：{entry.get('エラー', '')}"
+                    )
+
+        overall_progress.progress(idx / total, text=f"{idx} / {total} 完了")
+
+    overall_status.empty()
+    st.divider()
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("総数", total)
+    col2.metric("成功", len(results["success"]) + len(results["resumed"]))
+    col3.metric("失敗", len(results["fail"]))
+    col4.metric("スキップ", len(results["skipped"]))
+
+    if results["resumed"]:
+        st.info(f"♻️ {len(results['resumed'])} 件は既存フォルダを再利用して再開しました。")
+
+    if results["fail"]:
+        st.markdown("### ❌ 失敗した動画")
+        for f in results["fail"]:
+            st.write(
+                f"- **URL**: {f.get('URL')}  \n"
+                f"  - 失敗ステップ: `{f.get('失敗ステップ', '不明')}`  \n"
+                f"  - エラー: `{f.get('エラー', '')[:300]}`"
+            )
+
+    if results["success"] or results["resumed"]:
+        st.success(
+            f"新規 {len(results['success'])} 件 + 再開 {len(results['resumed'])} 件を分析完了。"
+            "「実行履歴」タブで一覧確認できます。"
+        )
+        st.balloons()
+
+    return results
+
+
 with tab_run:
     st.subheader("動画分析を実行")
-
-    # 失敗した過去エントリがあれば、再実行ボタンを提示
-    _failed = history.failed_entries()
-    if _failed:
-        with st.expander(f"⚠️ 前回までに **{len(_failed)}件** の失敗があります（同URLは既存フォルダを再利用して失敗ステップから再開できます）", expanded=False):
-            for e in _failed[:10]:
-                st.write(
-                    f"- **{e.get('タイトル') or '(未分析)'}** "
-                    f"｜失敗ステップ: `{e.get('失敗ステップ', '不明')}` "
-                    f"｜{e.get('URL')}"
-                )
-            if len(_failed) > 10:
-                st.caption(f"…他 {len(_failed) - 10} 件")
-            if st.button(f"❌ 失敗した {len(_failed)} 件を再実行", type="primary", key="rerun_failed"):
-                st.session_state["prefill_urls"] = "\n".join(e.get("URL", "") for e in _failed if e.get("URL"))
-                st.rerun()
 
     default_urls = st.session_state.pop("prefill_urls", "")
     raw_urls = st.text_area(
@@ -461,95 +542,36 @@ with tab_run:
 
     urls = parse_urls(raw_urls)
     if urls:
-        st.caption(f"📋 検出されたURL：**{len(urls)}件**")
+        # 履歴と照合して、事前に「スキップ/再開/新規」の内訳を表示
+        will_skip = []
+        will_resume = []
+        will_new = []
+        for u in urls:
+            p = history.find_by_url(u)
+            if p and p.get("ステータス") == "成功":
+                will_skip.append(u)
+            elif p and p.get("ステータス") == "失敗":
+                will_resume.append(u)
+            else:
+                will_new.append(u)
+        st.caption(
+            f"📋 検出されたURL：**{len(urls)}件** ／ "
+            f"🆕 新規 **{len(will_new)}** ｜ ♻️ 再開 **{len(will_resume)}** ｜ ⏭ スキップ **{len(will_skip)}**"
+        )
+        if will_resume:
+            with st.expander(f"♻️ 再開されるURL（{len(will_resume)}件）", expanded=False):
+                for u in will_resume:
+                    p = history.find_by_url(u)
+                    st.write(f"- `{p.get('失敗ステップ', '?')}` から再開: {u}")
+        if will_skip:
+            with st.expander(f"⏭ スキップされるURL（{len(will_skip)}件）", expanded=False):
+                for u in will_skip:
+                    st.write(f"- {u}")
+
     run = st.button("実行", type="primary", disabled=not urls)
 
     if run:
-        total = len(urls)
-        results = {"success": [], "resumed": [], "fail": [], "skipped": []}
-
-        overall_progress = st.progress(0, text=f"0 / {total} 完了")
-        overall_status = st.empty()
-
-        for idx, one_url in enumerate(urls, 1):
-            prefix = f"[{idx}/{total}] "
-            overall_status.info(f"🎬 {prefix}処理中：{one_url}")
-
-            # 既存履歴を参照。成功済みならスキップ、失敗ならアーティファクトを引き継ぐ
-            prior = history.find_by_url(one_url)
-            if prior and prior.get("ステータス") == "成功":
-                with st.expander(f"⏭ {prefix}{one_url}（既に成功済みのためスキップ）", expanded=False):
-                    st.info(f"✅ 前回成功済み：{prior.get('タイトル', '')}")
-                    st.markdown(f"📂 フォルダ：{prior.get('Driveフォルダ', '')}")
-                results["skipped"].append(prior)
-                overall_progress.progress(idx / total, text=f"{idx} / {total} 完了")
-                continue
-
-            with st.expander(f"🎬 {prefix}{one_url}", expanded=True):
-                inner_log = st.container()
-                inner_progress = st.progress(0, text=f"{prefix}開始します…")
-                entry = None
-                try:
-                    with tempfile.TemporaryDirectory() as tmpdir:
-                        entry = process_single_url(
-                            one_url, tmpdir, inner_log, inner_progress,
-                            prefix=prefix, prior_entry=prior,
-                        )
-                except Exception as e:
-                    inner_log.error(f"❌ {prefix}想定外の失敗：{e}")
-                    entry = {
-                        "実行日時": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "URL": one_url,
-                        "ステータス": "失敗",
-                        "失敗ステップ": "想定外エラー",
-                        "エラー": str(e),
-                    }
-                    if prior:
-                        # 既存アーティファクトIDだけは温存
-                        for k, v in prior.items():
-                            if k.startswith("_") and k not in entry:
-                                entry[k] = v
-
-                if entry:
-                    history.save_entry(entry)
-                    if entry.get("ステータス") == "成功":
-                        was_resumed = bool(prior)
-                        (results["resumed"] if was_resumed else results["success"]).append(entry)
-                        marker = "♻️ 再開して" if was_resumed else "✅ "
-                        inner_log.success(f"{marker}{prefix}完了：{entry.get('タイトル', '')}")
-                        inner_log.markdown(f"📂 フォルダ：{entry.get('Driveフォルダ', '')}")
-                    else:
-                        results["fail"].append(entry)
-                        inner_log.error(
-                            f"❌ {prefix}失敗（{entry.get('失敗ステップ', '不明')}）：{entry.get('エラー', '')}"
-                        )
-
-            overall_progress.progress(idx / total, text=f"{idx} / {total} 完了")
-
-        overall_status.empty()
-        st.divider()
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("総数", total)
-        col2.metric("成功", len(results["success"]) + len(results["resumed"]))
-        col3.metric("失敗", len(results["fail"]))
-        col4.metric("スキップ", len(results["skipped"]))
-
-        if results["resumed"]:
-            st.info(f"♻️ {len(results['resumed'])} 件は既存フォルダを再利用して再開しました。")
-
-        if results["fail"]:
-            with st.expander("❌ 失敗した動画", expanded=True):
-                for f in results["fail"]:
-                    st.write(f"- **URL**: {f.get('URL')}")
-                    st.write(f"  - 失敗ステップ: `{f.get('失敗ステップ', '不明')}`")
-                    st.write(f"  - エラー: `{f.get('エラー', '')}`")
-
-        if results["success"] or results["resumed"]:
-            st.success(
-                f"新規 {len(results['success'])} 件 + 再開 {len(results['resumed'])} 件を分析完了。"
-                "「実行履歴」タブで一覧確認できます。"
-            )
-            st.balloons()
+        execute_url_batch(urls)
 
 
 with tab_history:
@@ -630,19 +652,48 @@ with tab_history:
                 mime="text/csv",
             )
 
-        # 失敗行だけ抜粋表示（デバッグ用）
+        # 失敗行の再実行UI
         failed = [e for e in hist if e.get("ステータス") == "失敗"]
         if failed:
-            with st.expander(f"❌ 失敗した動画の詳細（{len(failed)}件）", expanded=False):
-                for e in failed:
-                    st.write(
-                        f"- **URL**: {e.get('URL')}  \n"
-                        f"  - 失敗箇所: `{e.get('失敗ステップ', '不明')}`  \n"
-                        f"  - エラー: `{e.get('エラー', '')[:300]}`"
-                    )
-                if st.button(f"❌ 失敗した {len(failed)} 件を「動画分析」タブから再実行", key="rerun_from_history"):
-                    st.session_state["prefill_urls"] = "\n".join(e.get("URL", "") for e in failed if e.get("URL"))
-                    st.info("「🎬 動画分析」タブに移動し、URLが自動入力されるので **実行** ボタンを押してください。")
+            st.markdown("---")
+            st.markdown(f"### ❌ 失敗した動画（{len(failed)}件）")
+
+            # 全件再実行ボタン（トップレベルに置く）
+            col_rerun_all, col_rerun_desc = st.columns([1, 3])
+            with col_rerun_all:
+                if st.button(
+                    f"▶ 全 {len(failed)} 件をここで再実行",
+                    type="primary",
+                    key="rerun_all_failed_direct",
+                ):
+                    st.session_state["_run_now_urls"] = [e.get("URL") for e in failed if e.get("URL")]
+                    st.rerun()
+            with col_rerun_desc:
+                st.caption("失敗ステップから再開。既存フォルダ・Docsは再利用されます。")
+
+            # 個別再実行ボタン
+            with st.expander("個別に選んで再実行 / 詳細を確認", expanded=False):
+                for idx, e in enumerate(failed):
+                    row_url = e.get("URL", "")
+                    col_info, col_btn = st.columns([5, 1])
+                    with col_info:
+                        st.write(
+                            f"- **{e.get('タイトル') or '(未分析)'}**  \n"
+                            f"  失敗箇所: `{e.get('失敗ステップ', '不明')}`  \n"
+                            f"  エラー: `{e.get('エラー', '')[:200]}`  \n"
+                            f"  URL: {row_url}"
+                        )
+                    with col_btn:
+                        if st.button("▶ 再実行", key=f"rerun_one_{idx}"):
+                            st.session_state["_run_now_urls"] = [row_url]
+                            st.rerun()
+
+            # 再実行トリガーがあれば履歴タブの下部で処理を開始
+            run_now_urls = st.session_state.pop("_run_now_urls", None)
+            if run_now_urls:
+                st.markdown("---")
+                st.info(f"🔁 {len(run_now_urls)} 件を実行します")
+                execute_url_batch(run_now_urls)
 
         with st.expander("⚠️ 履歴をクリア", expanded=False):
             st.warning("この操作は取り消せません。Drive上のファイルは削除されません。")
