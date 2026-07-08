@@ -56,18 +56,28 @@ def extract_key_frames(video_path: str, output_dir: str, count: int = 8) -> list
 
 
 def download_video(url: str, output_dir: str) -> tuple[str, dict]:
-    """IG/TikTok/YouTube等のURLから動画をダウンロード。
+    """IG/TikTok/YouTube等のURLから動画をダウンロード。音声を必ず含める。
     Returns: (ローカルファイルパス, メタ情報dict)"""
     os.makedirs(output_dir, exist_ok=True)
     ydl_opts = {
         "outtmpl": os.path.join(output_dir, "%(id)s.%(ext)s"),
-        "format": "best[ext=mp4]/best",
+        # bestvideo+bestaudio で音声を必ず含める。単一フォーマットのbestにフォールバック
+        "format": "bestvideo*+bestaudio/best",
+        "merge_output_format": "mp4",
         "quiet": True,
         "no_warnings": True,
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
         filepath = ydl.prepare_filename(info)
+        # マージ後は.mp4になるので、拡張子を補正
+        if not os.path.exists(filepath):
+            base = os.path.splitext(filepath)[0]
+            for ext in (".mp4", ".mkv", ".webm"):
+                candidate = base + ext
+                if os.path.exists(candidate):
+                    filepath = candidate
+                    break
 
     meta = {
         "id": info.get("id", ""),
