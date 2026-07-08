@@ -102,32 +102,55 @@ def download_video(url: str, output_dir: str) -> tuple[str, dict]:
     Returns: (ローカルファイルパス, メタ情報dict)"""
     os.makedirs(output_dir, exist_ok=True)
 
-    # フォーマット候補：シンプル→複雑の順で試す。1つ目が最も安定
+    # フォーマット候補：音声＋動画両方あるものを最優先。段階的に条件を緩める
     format_candidates = [
-        "best",                        # 単一の最良ストリーム（TikTokで最も安定）
-        "best[ext=mp4]/best",          # mp4優先
-        "bestvideo*+bestaudio/best",   # マージ型（最後の手段）
+        # 音声・動画両方ある単一ストリーム（TikTokで最も安定・確実に音声あり）
+        "best[acodec!=none][vcodec!=none]",
+        # mp4 + 音声あり
+        "best[ext=mp4][acodec!=none]/best[acodec!=none]",
+        # マージ型（動画と音声を別々に取得してffmpegで結合）
+        "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio",
+        # 最後の砦：音声不問
+        "best",
     ]
 
     filepath = None
     info = None
+    video_only_fallback = None
+    video_only_info = None
     for fmt in format_candidates:
         try:
-            filepath, info = _download_with_format(url, output_dir, fmt)
-            if not filepath or not os.path.exists(filepath):
+            candidate_path, candidate_info = _download_with_format(url, output_dir, fmt)
+            if not candidate_path or not os.path.exists(candidate_path):
                 continue
-            has_video, has_audio = _has_video_and_audio_streams(filepath)
-            # 動画ストリームがあればOK。音声はなくてもよい（音声のない動画もあり得る）
-            if has_video:
+            has_video, has_audio = _has_video_and_audio_streams(candidate_path)
+            if has_video and has_audio:
+                filepath = candidate_path
+                info = candidate_info
                 break
-            # 破損ファイル → 削除して次のフォーマットへ
+            if has_video and not has_audio:
+                # 音声なし。次のフォーマットで音声ありを狙うが、他が全滅した場合の保険として1つだけ保持
+                if video_only_fallback is None:
+                    video_only_fallback = candidate_path
+                    video_only_info = candidate_info
+                else:
+                    try:
+                        os.remove(candidate_path)
+                    except OSError:
+                        pass
+                continue
+            # 動画すらない → 破損。削除して次へ
             try:
-                os.remove(filepath)
+                os.remove(candidate_path)
             except OSError:
                 pass
-            filepath = None
         except Exception:
             continue
+
+    # 音声あり版が取れなかったら video-only フォールバックを使う（視覚のみで分析継続）
+    if not filepath and video_only_fallback:
+        filepath = video_only_fallback
+        info = video_only_info
 
     if not filepath or not os.path.exists(filepath):
         raise RuntimeError(f"ダウンロード失敗（全フォーマット試行済み）: {url}")

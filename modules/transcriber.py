@@ -60,6 +60,22 @@ def transcribe(video_path: str, language: str = "ja") -> tuple[str, list[str]]:
     except OSError:
         pass
 
+    # 診断: 音声ストリームの有無を事前確認（ffprobe）
+    try:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a",
+             "-show_entries", "stream=codec_type,codec_name",
+             "-of", "csv=p=0", video_path],
+            capture_output=True, text=True, timeout=30,
+        )
+        audio_info = (probe.stdout or "").strip()
+        if not audio_info:
+            logs.append("⚠️ 音声ストリームなし → 文字起こし不可（視覚のみで分析継続）")
+            return "", logs
+        logs.append(f"🎵 音声ストリーム検出: {audio_info}")
+    except Exception as e:
+        logs.append(f"⚠️ ffprobe実行失敗: {e.__class__.__name__}")
+
     # Try 1: 音声を強力に圧縮したmp3を作る（最も互換性高・小さいファイルサイズ）
     compressed_mp3 = os.path.join(tmp_dir, "audio.mp3")
     try:
