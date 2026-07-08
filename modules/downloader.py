@@ -129,10 +129,19 @@ def download_video(url: str, output_dir: str) -> tuple[str, dict]:
                 info = candidate_info
                 break
             if has_video and not has_audio:
-                # 音声なし。他候補で音声ありを狙うが、全滅時の保険として1つだけ保持
+                # 音声なし。他候補で音声ありを狙うが、全滅時の保険として1つだけ確保。
+                # 全フォーマットで同じ出力ファイル名を使うため、上書き回避のためリネームして退避する
                 if video_only_fallback is None:
-                    video_only_fallback = candidate_path
-                    video_only_info = candidate_info
+                    base, ext = os.path.splitext(candidate_path)
+                    reserved_path = f"{base}.videoonly{ext}"
+                    try:
+                        os.replace(candidate_path, reserved_path)
+                        video_only_fallback = reserved_path
+                        video_only_info = candidate_info
+                    except OSError:
+                        # リネームできなかった場合は元パスを使う（次で上書きされるかもしれないが最善策）
+                        video_only_fallback = candidate_path
+                        video_only_info = candidate_info
                 else:
                     try:
                         os.remove(candidate_path)
