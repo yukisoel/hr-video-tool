@@ -1,5 +1,9 @@
+import json
 import os
 import subprocess
+import urllib.parse
+import urllib.request
+
 import yt_dlp
 
 
@@ -97,6 +101,69 @@ def _download_with_format(url: str, output_dir: str, fmt: str) -> tuple[str, dic
     return filepath, info
 
 
+def _download_via_tikwm(url: str, output_dir: str) -> tuple[str, dict] | None:
+    """tikwm.com 公開API経由でTikTok動画をダウンロード（音声つき rendition を取れる）。
+    yt-dlpが video-only しか取れなかった場合のフォールバック専用。TikTok以外のURLは None を返す。
+    Returns: (filepath, info) or None
+    """
+    if "tiktok.com" not in url.lower():
+        return None
+    try:
+        api_url = "https://tikwm.com/api/"
+        payload = urllib.parse.urlencode({"url": url, "hd": "1"}).encode()
+        req = urllib.request.Request(
+            api_url,
+            data=payload,
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "application/json",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = resp.read()
+        api_result = json.loads(body.decode("utf-8"))
+        if not isinstance(api_result, dict) or api_result.get("code") != 0:
+            return None
+        data_obj = api_result.get("data") or {}
+        play_url = data_obj.get("hdplay") or data_obj.get("play")
+        if not play_url or not isinstance(play_url, str):
+            return None
+
+        video_id = str(data_obj.get("id") or "tikwm_video")
+        filepath = os.path.join(output_dir, f"{video_id}.mp4")
+        dl_req = urllib.request.Request(
+            play_url,
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Referer": "https://tikwm.com/",
+            },
+        )
+        with urllib.request.urlopen(dl_req, timeout=120) as resp:
+            with open(filepath, "wb") as f:
+                while True:
+                    chunk = resp.read(1024 * 64)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+
+        author = data_obj.get("author") or {}
+        info = {
+            "id": video_id,
+            "title": data_obj.get("title") or "",
+            "uploader": author.get("nickname") or "",
+            "uploader_id": author.get("unique_id") or "",
+            "duration": data_obj.get("duration"),
+            "upload_date": None,
+            "webpage_url": url,
+            "extractor_key": "TikTok",
+            "extractor": "TikTok (via tikwm.com)",
+        }
+        return filepath, info
+    except Exception:
+        return None
+
+
 def download_video(url: str, output_dir: str) -> tuple[str, dict]:
     """IG/TikTok/YouTube等のURLから動画をダウンロード。破損ファイル検知→再試行。
     Returns: (ローカルファイルパス, メタ情報dict)"""
@@ -159,7 +226,34 @@ def download_video(url: str, output_dir: str) -> tuple[str, dict]:
             per_format_errors.append(f"{fmt}: {e.__class__.__name__}: {str(e)[:150]}")
             continue
 
-    # 音声あり版が取れなかったら video-only フォールバックを使う（視覚のみで分析継続）
+    # yt-dlpで音声つきが取れなかった場合、tikwm.com経由で音声つきの取得を試みる（TikTokのみ）
+    if not filepath:
+        tikwm_result = _download_via_tikwm(url, output_dir)
+        if tikwm_result:
+            candidate_path, candidate_info = tikwm_result
+            if os.path.exists(candidate_path):
+                has_video, has_audio = _has_video_and_audio_streams(candidate_path)
+                if has_video and has_audio:
+                    # video-onlyフォールバックはもう不要なので掃除
+                    if video_only_fallback and video_only_fallback != candidate_path:
+                        try:
+                            os.remove(video_only_fallback)
+                        except OSError:
+                            pass
+                    filepath = candidate_path
+                    info = candidate_info
+                else:
+                    per_format_errors.append("tikwm.com: 音声なし")
+                    try:
+                        os.remove(candidate_path)
+                    except OSError:
+                        pass
+            else:
+                per_format_errors.append("tikwm.com: ファイル未生成")
+        else:
+            per_format_errors.append("tikwm.com: API失敗またはTikTok以外")
+
+    # tikwm.comもダメだったら video-only フォールバックを使う（視覚のみで分析継続）
     if not filepath and video_only_fallback:
         filepath = video_only_fallback
         info = video_only_info
